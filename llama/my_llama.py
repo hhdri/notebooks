@@ -261,29 +261,6 @@ class Llama3ScaledRoPE(nn.Module):
         return x_out.type_as(x)
 
 
-def _sdp_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    mask: Optional[torch.Tensor],
-    dropout_p: float,
-    is_causal: bool,
-) -> torch.Tensor:
-    # shape: [b, 1, s, s]
-    if mask is not None:
-        mask = mask[:, None, :, :]
-
-    # Flash attention from https://pytorch.org/blog/accelerating-large-language-models/
-    return nn.functional.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=mask,
-        dropout_p=dropout_p,
-        is_causal=is_causal,
-    )
-
-
 class KVCache(nn.Module):
     """
     Standalone ``nn.Module`` containing a kv-cache to cache past key and values during inference.
@@ -659,11 +636,13 @@ class MultiHeadAttention(nn.Module):
             k = k.unsqueeze(2).expand(expand_shape).flatten(1, 2)
             v = v.unsqueeze(2).expand(expand_shape).flatten(1, 2)
 
-        output = _sdp_attention(
+        if mask is not None:
+            mask = mask[:, None, :, :]
+        output = nn.functional.scaled_dot_product_attention(
             q,
             k,
             v,
-            mask=mask,
+            attn_mask=mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
             is_causal=self.kv_cache is None and mask is None and self.is_causal,
         )
@@ -1166,16 +1145,10 @@ class TransformerDecoder(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.causal_mask = None
-        self.num_output_chunks = 0
 
         # attributes for KV caches during inference
         self.encoder_max_cache_seq_len = None
         self.decoder_max_cache_seq_len = None
-
-    def set_num_output_chunks(self, num_output_chunks: int) -> None:
-        """Used to save memory in combination with :class:`~torchtune.modules.loss.CEWithChunkedOutputLoss`.
-        This should be called before the first forward pass, in the recipe."""
-        self.num_output_chunks = num_output_chunks
 
     def setup_caches(
         self,
@@ -1257,28 +1230,6 @@ class TransformerDecoder(nn.Module):
 
         for layer in self.layers:
             layer.reset_cache()
-
-    @torch.compiler.disable
-    def chunked_output(self, last_hidden_state: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Apply output projection in chunks. This should be applied in conjunction with
-        :class:`~torchtune.modules.loss.CEWithChunkedOutputLoss` as upcasting to fp32 is done there.
-
-        To use this method, you should first call
-        :func:`~torchtune.modules.TransformerDecoder.set_num_output_chunks`.
-
-        Args:
-            last_hidden_state (torch.Tensor): last hidden state of the decoder, having shape
-                [b, seq_len, embed_dim].
-
-        Returns:
-            List[torch.Tensor]: List of num_chunks output tensors, each with shape
-                [b, seq_len/num_chunks, out_dim], where out_dim is usually the vocab size.
-        """
-        return [
-            self.output(chunk)
-            for chunk in last_hidden_state.chunk(self.num_output_chunks, dim=1)
-        ]
 
     def _validate_inputs(
         self,
@@ -1422,11 +1373,8 @@ class TransformerDecoder(nn.Module):
         # shape: [b, s, d]
         h = self.norm(h)
 
-        if self.num_output_chunks > 0:
-            output = self.chunked_output(h)
-        else:
-            # shape: [b, seq_len, out_dim]
-            output = self.output(h).float()
+        # shape: [b, seq_len, out_dim]
+        output = self.output(h).float()
 
         # Output list if hidden states are requested, otherwise just the output
         # TODO: always output a list to have a consistent output type
