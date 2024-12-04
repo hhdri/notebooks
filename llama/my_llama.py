@@ -268,122 +268,57 @@ class Llama3ScaledRoPE(nn.Module):
         return x_out.type_as(x)
 
 
-def log_rank_zero(logger: logging.Logger, msg: str, level: int = logging.INFO) -> None:
-    """
-    Logs a message only on rank zero.
-
-    Args:
-        logger (logging.Logger): The logger.
-        msg (str): The warning message.
-        level (int): The logging level. See https://docs.python.org/3/library/logging.html#levels for values.
-            Defaults to ``logging.INFO``.
-    """
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    if rank != 0:
-        return
-    logger.log(level, msg, stacklevel=2)
-
-
 @lru_cache(None)
 def log_once(logger: logging.Logger, msg: str, level: int = logging.INFO) -> None:
-    """
-    Logs a message only once. LRU cache is used to ensure a specific message is
-    logged only once, similar to how :func:`~warnings.warn` works when the ``once``
-    rule is set via command-line or environment variable.
-
-    Args:
-        logger (logging.Logger): The logger.
-        msg (str): The warning message.
-        level (int): The logging level. See https://docs.python.org/3/library/logging.html#levels for values.
-            Defaults to ``logging.INFO``.
-    """
-    log_rank_zero(logger=logger, msg=msg, level=level)
+    logger.log(logger=logger, msg=msg, level=level)
 
 
-def _sdpa_or_flex_attention() -> Callable:
-    """
-    Helper function to decide when to call flex attention or SDPA. It will use
-    flex attention if ALL of the following conditions are met, otherwise it will
-    default to SDPA:
-    - torch version >= 2.5.0
-    - we are sample packing, therefore mask is a BlockMask
-    - torch.cuda.get_device_capability() >= (7, 5)
-    """
+def _flex_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    mask: Optional[_MaskType],
+    dropout_p: float,
+    is_causal: bool,
+) -> torch.Tensor:
 
-    if _SUPPORTS_FLEX_ATTENTION:
-
-        def _attention_call(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            mask: Optional[_MaskType],
-            dropout_p: float,
-            is_causal: bool,
-        ) -> torch.Tensor:
-
-            # Flex attention uses the BlockMask
-            # (https://github.com/pytorch/pytorch/blob/main/torch/nn/attention/flex_attention.py#L168)
-            # instead of a traditional boolean tensor mask. If this is passed in,
-            # we assume the user wants to use flex attention instead of traditional SDPA.
-            # This will use flash attention under the hood with support for custom masks.
-            # Currently, it is used when sample packing is enabled (see torchtune.datasets.PackedDataset)
-            if isinstance(mask, BlockMask):
-                log_once(
-                    _log,
-                    "Using flex attention for attention computation since a BlockMask was passed in.",
-                    level=logging.DEBUG,
-                )
-                if dropout_p > 0.0:
-                    raise ValueError(
-                        "Flex attention does not support dropout. Please set dropout to 0.0."
-                    )
-                return compile_friendly_flex_attention(
-                    q,
-                    k,
-                    v,
-                    block_mask=mask,
-                )
-            # If mask is a standard boolean tensor or None, then use SDPA
-            else:
-                # shape: [b, 1, s, s]
-                if mask is not None:
-                    mask = mask[:, None, :, :]
-
-                # Flash attention from https://pytorch.org/blog/accelerating-large-language-models/
-                return nn.functional.scaled_dot_product_attention(
-                    q,
-                    k,
-                    v,
-                    attn_mask=mask,
-                    dropout_p=dropout_p,
-                    is_causal=is_causal,
-                )
-
-    else:
-
-        def _attention_call(
-            q: torch.Tensor,
-            k: torch.Tensor,
-            v: torch.Tensor,
-            mask: Optional[_MaskType],
-            dropout_p: float,
-            is_causal: bool,
-        ) -> torch.Tensor:
-            # shape: [b, 1, s, s]
-            if mask is not None:
-                mask = mask[:, None, :, :]
-
-            # Flash attention from https://pytorch.org/blog/accelerating-large-language-models/
-            return nn.functional.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
+    # Flex attention uses the BlockMask
+    # (https://github.com/pytorch/pytorch/blob/main/torch/nn/attention/flex_attention.py#L168)
+    # instead of a traditional boolean tensor mask. If this is passed in,
+    # we assume the user wants to use flex attention instead of traditional SDPA.
+    # This will use flash attention under the hood with support for custom masks.
+    # Currently, it is used when sample packing is enabled (see torchtune.datasets.PackedDataset)
+    if isinstance(mask, BlockMask):
+        log_once(
+            _log,
+            "Using flex attention for attention computation since a BlockMask was passed in.",
+            level=logging.DEBUG,
+        )
+        if dropout_p > 0.0:
+            raise ValueError(
+                "Flex attention does not support dropout. Please set dropout to 0.0."
             )
+        return compile_friendly_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=mask,
+        )
+    # If mask is a standard boolean tensor or None, then use SDPA
+    else:
+        # shape: [b, 1, s, s]
+        if mask is not None:
+            mask = mask[:, None, :, :]
 
-    return _attention_call
+        # Flash attention from https://pytorch.org/blog/accelerating-large-language-models/
+        return nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+        )
 
 
 class KVCache(nn.Module):
@@ -611,9 +546,6 @@ class MultiHeadAttention(nn.Module):
         self.k_norm = k_norm
         self.pos_embeddings = pos_embeddings
 
-        # Use flex attention if supported and we are sample packing
-        self._attention_call = _sdpa_or_flex_attention()
-
         # this flag indicates whether to update the kv-cache during forward
         # passes. when disabled, we can have the cache setup but still
         # perform normal forward passes
@@ -764,7 +696,7 @@ class MultiHeadAttention(nn.Module):
             k = k.unsqueeze(2).expand(expand_shape).flatten(1, 2)
             v = v.unsqueeze(2).expand(expand_shape).flatten(1, 2)
 
-        output = self._attention_call(
+        output = _flex_attention(
             q,
             k,
             v,
