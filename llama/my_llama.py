@@ -760,7 +760,6 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -772,7 +771,7 @@ class FeedForward(nn.Module):
             torch.Tensor: output tensor with shape ``(..., out_dim)``, where ``out_dim`` is the \
                 output dimension of ``down_proj``.
         """
-        h = self.activation(self.w1(x))
+        h = F.silu(self.w1(x))
         h = h * self.w3(x)
         h = self.w2(h)
         return h
@@ -822,8 +821,6 @@ class TransformerDecoder(nn.Module):
         head_dim: int,
         norm: nn.Module,
         output: Union[nn.Linear, Callable],
-        num_layers: Optional[int] = None,
-        output_hidden_states: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
 
@@ -831,33 +828,11 @@ class TransformerDecoder(nn.Module):
         self.layers = layers
         self.norm = norm
         self.output = output
-        self.output_hidden_states = output_hidden_states or []
         self.max_seq_len = max_seq_len
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.causal_mask = None
-
-        # attributes for KV caches during inference
-        self.encoder_max_cache_seq_len = None
-        self.decoder_max_cache_seq_len = None
 
     def _validate_inputs(self, seq_len: int):
-        """
-        Validates inputs for ``forward``.
-        Args:
-            seq_len (int): Input tensor sequence length.
-            mask (Optional[torch.Tensor]): Attention mask used for inference and for sequence packing.
-            encoder_input (Optional[torch.Tensor]): Encoder input for cross-attention.
-            encoder_mask (Optional[torch.Tensor]): Encoder attention mask for cross-embedding attention.
-            input_pos (Optional[torch.Tensor]): Input tensor position IDs.
-
-        Raises:
-            ValueError: if seq_len of x is bigger than max_seq_len
-            ValueError: if the model has caches which have been setup with self-attention layers and ``mask`` is not provided.
-            ValueError: if the model has caches which have been setup with encoder layers and ``encoder_mask`` is not provided.
-            ValueError: if the model has caches which have been setup ``input_pos`` is not provided.
-        """
-
         if seq_len > self.max_seq_len:
             raise ValueError(
                 f"seq_len ({seq_len}) of input tensor should be smaller "
@@ -936,10 +911,7 @@ class TransformerDecoder(nn.Module):
         # shape: [b, s, d]
         h = self.tok_embeddings(tokens)
 
-        hidden = []
         for i, layer in enumerate(self.layers):
-            if i in self.output_hidden_states:
-                hidden.append(h)
             # shape: [b, s, d]
             h = layer(
                 h,
@@ -955,9 +927,6 @@ class TransformerDecoder(nn.Module):
         # shape: [b, seq_len, out_dim]
         output = self.output(h).float()
 
-        # Output list if hidden states are requested, otherwise just the output
-        # TODO: always output a list to have a consistent output type
-        output = output if not hidden else [*hidden, output]
         return output
 
 
@@ -1004,7 +973,6 @@ def llama3_2(
         TransformerDecoder: Instantiation of Llama3.2 model.
     """
     head_dim = embed_dim // num_heads
-    num_kv_heads = num_kv_heads if num_kv_heads else num_heads
     rope = Llama3ScaledRoPE(
         dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor
     )
