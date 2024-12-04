@@ -841,14 +841,7 @@ class TransformerDecoder(nn.Module):
         self.encoder_max_cache_seq_len = None
         self.decoder_max_cache_seq_len = None
 
-    def _validate_inputs(
-        self,
-        seq_len: int,
-        mask: Optional[torch.Tensor] = None,
-        encoder_input: Optional[torch.Tensor] = None,
-        encoder_mask: Optional[torch.Tensor] = None,
-        input_pos: Optional[torch.Tensor] = None,
-    ):
+    def _validate_inputs(self, seq_len: int):
         """
         Validates inputs for ``forward``.
         Args:
@@ -938,13 +931,7 @@ class TransformerDecoder(nn.Module):
         # input tensor of shape [b, s]
         seq_len = tokens.shape[1]
 
-        self._validate_inputs(
-            seq_len,
-            mask=mask,
-            encoder_input=encoder_input,
-            encoder_mask=encoder_mask,
-            input_pos=input_pos,
-        )
+        self._validate_inputs(seq_len)
 
         # shape: [b, s, d]
         h = self.tok_embeddings(tokens)
@@ -1036,11 +1023,9 @@ def llama3_2(
             max_seq_len=max_seq_len,
             attn_dropout=attn_dropout,
         )
-        hidden_dim = intermediate_dim
-        mlp = FeedForward(dim=embed_dim, hidden_dim=hidden_dim)
         layer = TransformerSelfAttentionLayer(
             attn=self_attn,
-            mlp=mlp,
+            mlp=FeedForward(dim=embed_dim, hidden_dim=intermediate_dim),
             sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
             mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
         )
