@@ -24,9 +24,9 @@ with safe_open(model_path, framework="pt", device="cpu") as f:
         state_dict[k] = f.get_tensor(k)
 state_dict = hf_to_tune(state_dict, num_heads=32, num_kv_heads=8, dim=2048, head_dim=64)
 # dump all keys to a file
-with open('all_keys.txt', 'w') as f:
-    for k in state_dict.keys():
-        f.write(k + '\n')
+# with open('all_keys.txt', 'w') as f:
+#     for k in state_dict.keys():
+#         f.write(k + '\n')
 model_tt.load_state_dict(state_dict)
 # model_tt = torch.compile(model_tt)
 

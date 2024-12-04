@@ -455,36 +455,18 @@ class MultiHeadAttention(nn.Module):
 
 
 class RMSNorm(nn.Module):
-    """
-    Root Mean Square Normalization in fp32.
-
-    See: https://pytorch.org/docs/stable/generated/torch.nn.RMSNorm.html
-
-    Args:
-        dim (int): embedding size
-        eps (float): small value to avoid division by zero. Default: 1e-6
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    def __init__(self, dim: int) -> None:
         super().__init__()
         self.normalized_shape = (dim,)
-        self.eps = eps
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor to normalize
-
-        Returns:
-            torch.Tensor: The normalized and scaled tensor having the same shape as ``x``.
-        """
         # computation is in fp32
         return F.rms_norm(
             x.float(),
             normalized_shape=self.normalized_shape,
             weight=self.scale,
-            eps=self.eps,
+            eps=1e-5,
         ).to(x.dtype)
 
 
@@ -807,8 +789,8 @@ def llama3_2(
         layer = TransformerSelfAttentionLayer(
             attn=self_attn,
             mlp=FeedForward(dim=embed_dim, hidden_dim=intermediate_dim),
-            sa_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
-            mlp_norm=RMSNorm(dim=embed_dim, eps=norm_eps),
+            sa_norm=RMSNorm(dim=embed_dim),
+            mlp_norm=RMSNorm(dim=embed_dim),
         )
         layers.append(layer)
     layers = nn.ModuleList(layers)
@@ -821,7 +803,7 @@ def llama3_2(
         max_seq_len=max_seq_len,
         num_heads=num_heads,
         head_dim=head_dim,
-        norm=RMSNorm(embed_dim, eps=norm_eps),
+        norm=RMSNorm(embed_dim),
         output=output_proj,
     )
 
@@ -842,7 +824,6 @@ def llama3_2_1b() -> TransformerDecoder:
         max_seq_len=131072,
         intermediate_dim=8192,
         attn_dropout=0.0,
-        norm_eps=1e-5,
         rope_base=500_000,
         scale_factor=32,
     )
