@@ -19,9 +19,15 @@ model_path = '/Users/majid/.cache/huggingface/hub/models--meta-llama--Llama-3.2-
 model_tt = llama3_2_1b()
 
 state_dict = {}
+all_keys = []
 with safe_open(model_path, framework="pt", device="cpu") as f:
     for k in f.keys():
         state_dict[k] = f.get_tensor(k)
+        all_keys.append(k)
+# dump all keys to a file
+with open('all_keys.txt', 'w') as f:
+    for k in all_keys:
+        f.write(f'{k}\n')
 state_dict = hf_to_tune(state_dict, num_heads=32, num_kv_heads=8, dim=2048, head_dim=64)
 model_tt.load_state_dict(state_dict)
 # model_tt = torch.compile(model_tt)
