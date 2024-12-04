@@ -9,11 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import distributed as dist
 from torchao.dtypes.nf4tensor import linear_nf4, to_nf4
-from torch.nn.attention.flex_attention import (BlockMask, flex_attention)
+from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 _MaskType = Union[torch.Tensor, BlockMask]
 _SUPPORTS_FLEX_ATTENTION = True
 flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+
 
 # We cannot do nested compile, but flex attention only has perf benefits
 # when compiled. To insulate it from the compiler, we wrap it with
@@ -28,30 +29,9 @@ def compile_friendly_flex_attention(
 ) -> torch.Tensor:
     return flex_attention_compiled(q, k, v, block_mask=block_mask)
 
-def get_logger(level: Optional[str] = None) -> logging.Logger:
-    """
-    Get a logger with a stream handler.
 
-    Args:
-        level (Optional[str]): The logging level. See https://docs.python.org/3/library/logging.html#levels for list of levels.
+_log = logging.getLogger(__name__)
 
-    Example:
-        >>> logger = get_logger("INFO")
-        >>> logger.info("Hello world!")
-        INFO:torchtune.utils._logging:Hello world!
-
-    Returns:
-        logging.Logger: The logger.
-    """
-    logger = logging.getLogger(__name__)
-    if not logger.hasHandlers():
-        logger.addHandler(logging.StreamHandler())
-    if level is not None:
-        level = getattr(logging, level.upper())
-        logger.setLevel(level)
-    return logger
-_log: logging.Logger = get_logger()
-logger = logging.getLogger(__name__)
 
 def scale_hidden_dim_for_mlp(dim: int, multiple_of: int = 256) -> int:
     """Scale hidden dimension for MLP to keep number of parameters and computation constant.
@@ -70,21 +50,6 @@ def scale_hidden_dim_for_mlp(dim: int, multiple_of: int = 256) -> int:
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     return hidden_dim
 
-
-class Linear(nn.Module):
-    """
-    nn.Module used in :func:`~torchtune.modules.tied_linear.TiedLinear`, added to work with the hooks
-    :class:`~torchtune.training._activation_offloading.NoOpManager` that ignore activation
-    offloading context manager.
-
-    Without this class, we can't add NoOp hooks, and we will offload the activation of
-    the tied linear layer, which is slow.
-
-    For more information, see how NoOpManager is called in the recipes.
-    """
-
-    def forward(self, x: torch.Tensor, weight: torch.Tensor):
-        return F.linear(x, weight)
 
 class TiedLinear:
     """
@@ -107,7 +72,6 @@ class TiedLinear:
 
     def __init__(self, tied_module: nn.Module):
         self.tied_module = tied_module
-        self.linear = Linear()
         if not hasattr(tied_module, "weight"):
             raise AttributeError(
                 "Provided module does not have attribute 'weight'. Please check your tied_module."
@@ -122,7 +86,7 @@ class TiedLinear:
             torch.Tensor: The output tensor, having shape ``(..., out_dim)``, where ``out_dim`` is \
                 the output dimension of the tied module.
         """
-        return self.linear(x, self.tied_module.weight)
+        return F.linear(x, self.tied_module.weight)
 
 
 class Llama3ScaledRoPE(nn.Module):
@@ -319,6 +283,7 @@ def log_rank_zero(logger: logging.Logger, msg: str, level: int = logging.INFO) -
         return
     logger.log(level, msg, stacklevel=2)
 
+
 @lru_cache(None)
 def log_once(logger: logging.Logger, msg: str, level: int = logging.INFO) -> None:
     """
@@ -419,6 +384,7 @@ def _sdpa_or_flex_attention() -> Callable:
             )
 
     return _attention_call
+
 
 class KVCache(nn.Module):
     """
@@ -522,7 +488,6 @@ class KVCache(nn.Module):
         self.cache_pos += seq_len
 
         return k_out, v_out
-
 
 
 class MultiHeadAttention(nn.Module):
@@ -667,7 +632,7 @@ class MultiHeadAttention(nn.Module):
         """
         # Don't overwrite user defined kv_cache from init
         if self.kv_cache is not None:
-            logger.warning(
+            _log.warning(
                 "Key value caches are already setup. You cannot call ``setup_caches()`` twice. Skipping."
             )
         else:

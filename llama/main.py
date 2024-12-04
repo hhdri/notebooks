@@ -36,7 +36,7 @@ batches = text_enc['input_ids'][0, :-residual].reshape(-1, batch_size, context_l
 batches_attention_mask = torch.ones_like(batches).to('cpu')
 print(batches.shape)
 
-batch_idx = 21
+batch_idx = 22
 
 with torch.no_grad():
     out = model_tt(batches[batch_idx])
