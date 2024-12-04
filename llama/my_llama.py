@@ -1,4 +1,3 @@
-import copy
 import math
 import logging
 from typing import List, Optional, Union, Callable, Dict, Tuple
@@ -6,24 +5,8 @@ from typing import List, Optional, Union, Callable, Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchao.dtypes.nf4tensor import linear_nf4, to_nf4
 
 _log = logging.getLogger(__name__)
-
-
-def _get_clones(module: nn.Module, n: int) -> nn.ModuleList:
-    """
-    Return a list of ``n`` identical layers.
-
-    Args:
-        module (nn.Module): module to be cloned
-        n (int): number of clones
-
-    Returns:
-        nn.ModuleList: list of ``n`` identical layers
-    """
-    # FIXME: copy.deepcopy() is not defined on nn.module
-    return nn.ModuleList([copy.deepcopy(module) for i in range(n)])
 
 
 def scale_hidden_dim_for_mlp(dim: int, multiple_of: int = 256) -> int:
@@ -995,13 +978,12 @@ class FeedForward(nn.Module):
         *,
         dim: int,
         hidden_dim: int,
-        activation: nn.Module = nn.SiLU(),
     ):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-        self.activation = activation
+        self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -1014,8 +996,7 @@ class FeedForward(nn.Module):
                 output dimension of ``down_proj``.
         """
         h = self.activation(self.w1(x))
-        if self.w3 is not None:
-            h = h * self.w3(x)
+        h = h * self.w3(x)
         h = self.w2(h)
         return h
 
@@ -1068,16 +1049,6 @@ class TransformerDecoder(nn.Module):
         output_hidden_states: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
-        if isinstance(layers, nn.ModuleList):
-            pass
-        elif isinstance(layers, list):
-            layers = nn.ModuleList(layers)
-        else:
-            if not isinstance(layers, nn.Module):
-                raise AssertionError("num_layers is defined, layers must be a module")
-            if num_layers is None:
-                raise AssertionError("num_layers is not defined, layers must be a list")
-            layers = _get_clones(layers, num_layers)
 
         self.tok_embeddings = tok_embeddings
         self.layers = layers
