@@ -154,9 +154,7 @@ class Llama3ScaledRoPE(nn.Module):
                 new_freqs.append((1 - smooth) * freq / scale_factor + smooth * freq)
         return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): input tensor with shape
@@ -257,10 +255,6 @@ class MultiHeadAttention(nn.Module):
         v_proj (nn.Module): projection layer for value.
         output_proj (nn.Module): projection layer for output.
         pos_embeddings (Optional[nn.Module]): positional embeddings layer, e.g. RotaryPositionalEmbeddings.
-        q_norm (Optional[nn.Module]): normalization layer for query, e.g. RMSNorm. For decoding, this is applied
-            before updating from kv_cache. This means it will only support token wide normalization and not
-            batch or sequence wide normalization.
-        k_norm (Optional[nn.Module]): normalization layer for key, must be set if q_norm is.
         kv_cache (Optional[KVCache]): KVCache object used to cache key and value
         max_seq_len (int): maximum sequence length supported by the model.
             This is needed to compute the RoPE Cache. Default: 4096.
@@ -272,7 +266,6 @@ class MultiHeadAttention(nn.Module):
         ValueError: If ``num_heads % num_kv_heads != 0``
         ValueError: If ``embed_dim % num_heads != 0``
         ValueError: If ``attn_dropout < 0`` or ``attn_dropout > 1``
-        ValueError: if q_norm is defined without k_norm or vice versa
     """
 
     def __init__(
@@ -287,8 +280,6 @@ class MultiHeadAttention(nn.Module):
         v_proj: nn.Module,
         output_proj: nn.Module,
         pos_embeddings: Optional[nn.Module] = None,
-        q_norm: Optional[nn.Module] = None,
-        k_norm: Optional[nn.Module] = None,
         kv_cache=None,
         max_seq_len: int = 4096,
         is_causal: bool = True,
@@ -310,9 +301,6 @@ class MultiHeadAttention(nn.Module):
         if attn_dropout < 0 or attn_dropout > 1:
             raise ValueError(f"attn_dropout ({embed_dim}) must be between 0.0 and 1.0")
 
-        if bool(q_norm) ^ bool(k_norm):
-            raise ValueError("q and k norm must be set together")
-
         # Set attributes
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -328,8 +316,6 @@ class MultiHeadAttention(nn.Module):
         self.k_proj = k_proj
         self.v_proj = v_proj
         self.output_proj = output_proj
-        self.q_norm = q_norm
-        self.k_norm = k_norm
         self.pos_embeddings = pos_embeddings
 
         # this flag indicates whether to update the kv-cache during forward
@@ -397,10 +383,6 @@ class MultiHeadAttention(nn.Module):
         # [b, n_h, s_x, h_d]
         q = q.transpose(1, 2)
 
-        # Normalize q
-        if self.q_norm is not None:
-            q = self.q_norm(q)
-
         if y is None:
             if self.kv_cache is None or not self.cache_enabled:
                 raise ValueError(
@@ -425,10 +407,6 @@ class MultiHeadAttention(nn.Module):
             # k,v shape: [b, n_kv, s_y, h_d]
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-
-            # Normalize k
-            if self.k_norm is not None:
-                k = self.k_norm(k)
 
             # Update key-value cache
             if self.kv_cache is not None and self.cache_enabled:
