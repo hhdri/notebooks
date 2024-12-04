@@ -7,27 +7,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchao.dtypes.nf4tensor import linear_nf4, to_nf4
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
-
-_MaskType = Union[torch.Tensor, BlockMask]
-flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
-
-
-# We cannot do nested compile, but flex attention only has perf benefits
-# when compiled. To insulate it from the compiler, we wrap it with
-# compiler.disable so that it can be used regardless of whether the model
-# is compiled or not, and flex attention always remains compiled.
-@torch.compiler.disable(recursive=False)
-def compile_friendly_flex_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_mask: BlockMask,
-) -> torch.Tensor:
-    return flex_attention_compiled(q, k, v, block_mask=block_mask)
-
 
 _log = logging.getLogger(__name__)
+
+
+def _get_clones(module: nn.Module, n: int) -> nn.ModuleList:
+    """
+    Return a list of ``n`` identical layers.
+
+    Args:
+        module (nn.Module): module to be cloned
+        n (int): number of clones
+
+    Returns:
+        nn.ModuleList: list of ``n`` identical layers
+    """
+    # FIXME: copy.deepcopy() is not defined on nn.module
+    return nn.ModuleList([copy.deepcopy(module) for i in range(n)])
 
 
 def scale_hidden_dim_for_mlp(dim: int, multiple_of: int = 256) -> int:
@@ -265,52 +261,27 @@ class Llama3ScaledRoPE(nn.Module):
         return x_out.type_as(x)
 
 
-def _flex_attention(
+def _sdp_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    mask: Optional[_MaskType],
+    mask: Optional[torch.Tensor],
     dropout_p: float,
     is_causal: bool,
 ) -> torch.Tensor:
+    # shape: [b, 1, s, s]
+    if mask is not None:
+        mask = mask[:, None, :, :]
 
-    # Flex attention uses the BlockMask
-    # (https://github.com/pytorch/pytorch/blob/main/torch/nn/attention/flex_attention.py#L168)
-    # instead of a traditional boolean tensor mask. If this is passed in,
-    # we assume the user wants to use flex attention instead of traditional SDPA.
-    # This will use flash attention under the hood with support for custom masks.
-    # Currently, it is used when sample packing is enabled (see torchtune.datasets.PackedDataset)
-    if isinstance(mask, BlockMask):
-        _log.log(
-            _log,
-            "Using flex attention for attention computation since a BlockMask was passed in.",
-            level=logging.DEBUG,
-        )
-        if dropout_p > 0.0:
-            raise ValueError(
-                "Flex attention does not support dropout. Please set dropout to 0.0."
-            )
-        return compile_friendly_flex_attention(
-            q,
-            k,
-            v,
-            block_mask=mask,
-        )
-    # If mask is a standard boolean tensor or None, then use SDPA
-    else:
-        # shape: [b, 1, s, s]
-        if mask is not None:
-            mask = mask[:, None, :, :]
-
-        # Flash attention from https://pytorch.org/blog/accelerating-large-language-models/
-        return nn.functional.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            dropout_p=dropout_p,
-            is_causal=is_causal,
-        )
+    # Flash attention from https://pytorch.org/blog/accelerating-large-language-models/
+    return nn.functional.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+    )
 
 
 class KVCache(nn.Module):
@@ -582,7 +553,7 @@ class MultiHeadAttention(nn.Module):
         x: torch.Tensor,
         y: Optional[torch.Tensor] = None,
         *,
-        mask: Optional[_MaskType] = None,
+        mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -590,7 +561,7 @@ class MultiHeadAttention(nn.Module):
             x (torch.Tensor): input tensor with shape [b x s_x x d] for the query
             y (Optional[torch.Tensor]): second input tensor with shape [b x s_y x d], is the input
                 for k and v. For self attention, x=y. Optional only with kv_cache enabled.
-            mask (Optional[_MaskType]): Used to mask the scores after the query-key multiplication
+            mask (Optional[torch.Tensor]): Used to mask the scores after the query-key multiplication
                 and before the softmax. Either:
 
                 A boolean tensor with shape ``[b x s x s]``, ``[b x s x self.encoder_max_cache_seq_len]``,
@@ -688,7 +659,7 @@ class MultiHeadAttention(nn.Module):
             k = k.unsqueeze(2).expand(expand_shape).flatten(1, 2)
             v = v.unsqueeze(2).expand(expand_shape).flatten(1, 2)
 
-        output = _flex_attention(
+        output = _sdp_attention(
             q,
             k,
             v,
@@ -864,7 +835,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        mask: Optional[_MaskType] = None,
+        mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         **kwargs: Dict,
     ) -> torch.Tensor:
@@ -872,7 +843,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         Args:
             x (torch.Tensor): input tensor with shape
                 [batch_size x seq_length x embed_dim]
-            mask (Optional[_MaskType]): Used to mask the scores after the query-key multiplication
+            mask (Optional[torch.Tensor]): Used to mask the scores after the query-key multiplication
                 and before the softmax. Either:
 
                 A boolean tensor with shape ``[b x s x s]``, ``[b x s x self.encoder_max_cache_seq_len]``,
@@ -1083,21 +1054,6 @@ class TransformerCrossAttentionLayer(nn.Module):
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         out = h + self.mlp_scale(mlp_out)
         return out
-
-
-def _get_clones(module: nn.Module, n: int) -> nn.ModuleList:
-    """
-    Return a list of ``n`` identical layers.
-
-    Args:
-        module (nn.Module): module to be cloned
-        n (int): number of clones
-
-    Returns:
-        nn.ModuleList: list of ``n`` identical layers
-    """
-    # FIXME: copy.deepcopy() is not defined on nn.module
-    return nn.ModuleList([copy.deepcopy(module) for i in range(n)])
 
 
 class FeedForward(nn.Module):
@@ -1376,7 +1332,7 @@ class TransformerDecoder(nn.Module):
         self,
         tokens: torch.Tensor,
         *,
-        mask: Optional[_MaskType] = None,
+        mask: Optional[torch.Tensor] = None,
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
@@ -1384,7 +1340,7 @@ class TransformerDecoder(nn.Module):
         """
         Args:
             tokens (torch.Tensor): input tensor with shape ``[b x s]``
-            mask (Optional[_MaskType]): Used to mask the scores after the query-key multiplication
+            mask (Optional[torch.Tensor]): Used to mask the scores after the query-key multiplication
                 and before the softmax. This parameter is required during inference if caches have been setup.
                 Either:
 
