@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional, Union, Callable, Dict
+from typing import Optional, Dict
 
 import torch
 import torch.nn as nn
