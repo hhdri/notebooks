@@ -31,17 +31,6 @@ class RMSNorm(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """This class implements the feed-forward network derived from Llama2.
-
-    Args:
-        gate_proj (nn.Module): Projection from input dim to hidden dim, fed through activation
-            and multiplied by up_proj.
-        down_proj (nn.Module): Final projection to output dim.
-        up_proj (Optional[nn.Module]): Projection from input dim to hidden dim, multiplied by
-            activation(gate_proj).
-        activation (nn.Module): Activation function to use. Default is nn.SiLU().
-    """
-
     def __init__(self, *, dim: int, hidden_dim: int):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
@@ -601,23 +590,56 @@ class TransformerDecoder(nn.Module):
     def __init__(
         self,
         *,
-        tok_embeddings: nn.Embedding,
-        layers: Union[nn.Module, List[nn.Module], nn.ModuleList],
+        vocab_size: int,
+        num_layers: int,
+        rope_base: int,
+        embed_dim: int,
+        num_kv_heads: int,
+        scale_factor: int,
+        intermediate_dim: int,
+        attn_dropout: float,
         max_seq_len: int,
         num_heads: int,
-        head_dim: int,
-        norm: nn.Module,
-        output: Union[nn.Linear, Callable],
     ) -> None:
         super().__init__()
 
-        self.tok_embeddings = tok_embeddings
-        self.layers = layers
-        self.norm = norm
-        self.output = output
         self.max_seq_len = max_seq_len
         self.num_heads = num_heads
-        self.head_dim = head_dim
+
+        self.tok_embeddings = nn.Embedding(vocab_size, embed_dim)
+        self.norm = RMSNorm(embed_dim)
+        self.output = TiedLinear(self.tok_embeddings)
+        self.head_dim = embed_dim // num_heads
+        rope = Llama3ScaledRoPE(
+            dim=self.head_dim,
+            max_seq_len=max_seq_len,
+            base=rope_base,
+            scale_factor=scale_factor,
+        )
+
+        self.layers = []
+        for _ in range(num_layers):
+            self_attn = MultiHeadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=self.head_dim,
+                q_proj=nn.Linear(embed_dim, num_heads * self.head_dim, bias=False),
+                k_proj=nn.Linear(embed_dim, num_kv_heads * self.head_dim, bias=False),
+                v_proj=nn.Linear(embed_dim, num_kv_heads * self.head_dim, bias=False),
+                output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+                pos_embeddings=rope,
+                max_seq_len=max_seq_len,
+                attn_dropout=attn_dropout,
+            )
+            layer = TransformerSelfAttentionLayer(
+                attn=self_attn,
+                mlp=FeedForward(dim=embed_dim, hidden_dim=intermediate_dim),
+                sa_norm=RMSNorm(dim=embed_dim),
+                mlp_norm=RMSNorm(dim=embed_dim),
+            )
+            self.layers.append(layer)
+        self.layers = nn.ModuleList(self.layers)
 
     def _validate_inputs(self, seq_len: int):
         if seq_len > self.max_seq_len:
@@ -717,89 +739,8 @@ class TransformerDecoder(nn.Module):
         return output
 
 
-def llama3_2(
-    vocab_size: int,
-    num_layers: int,
-    num_heads: int,
-    num_kv_heads: int,
-    embed_dim: int,
-    max_seq_len: int,
-    intermediate_dim: int,
-    attn_dropout: float = 0.0,
-    rope_base: int = 500_000,
-    scale_factor: int = 32,
-) -> TransformerDecoder:
-    """
-    Build the decoder associated with the Llama3.2 model. This includes:
-    - Token embeddings
-    - num_layers number of TransformerSelfAttentionLayer blocks
-    - RMS Norm layer applied to the output of the transformer
-    - Final projection into token space
-
-    Args:
-        vocab_size (int): number of tokens in vocabulary.
-        num_layers (int): number of layers in the transformer decoder.
-        num_heads (int): number of query heads. For MHA this is also the
-            number of heads for key and value
-        num_kv_heads (int): number of key and value heads. User should ensure
-            `num_heads` % `num_kv_heads` == 0. For standard MHA set `num_kv_heads` == `num_heads`,
-            for GQA `num_kv_heads` < `num_heads`, and for MQA set `num_kv_heads` == 1.
-        embed_dim (int): embedding dimension for self-attention
-        max_seq_len (int): maximum sequence length the model will be run with, as used
-            by :func:`~torchtune.modules.KVCache`
-        rope_base (int): base for the rotary positional embeddings. Default: 500_000
-        attn_dropout (float): dropout value passed onto scaled_dot_product_attention.
-            Default: 0.0
-        intermediate_dim (Optional[int]): intermediate dimension for MLP. If not specified,
-            this is computed using :func:`~torchtune.modules.scale_hidden_dim_for_mlp`
-        scale_factor (int): scaling factor for RoPE. Default: 32
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 model.
-    """
-    head_dim = embed_dim // num_heads
-    rope = Llama3ScaledRoPE(
-        dim=head_dim, max_seq_len=max_seq_len, base=rope_base, scale_factor=scale_factor
-    )
-    layers = []
-    for _ in range(num_layers):
-        self_attn = MultiHeadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=False),
-            k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
-            v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=False),
-            output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
-            pos_embeddings=rope,
-            max_seq_len=max_seq_len,
-            attn_dropout=attn_dropout,
-        )
-        layer = TransformerSelfAttentionLayer(
-            attn=self_attn,
-            mlp=FeedForward(dim=embed_dim, hidden_dim=intermediate_dim),
-            sa_norm=RMSNorm(dim=embed_dim),
-            mlp_norm=RMSNorm(dim=embed_dim),
-        )
-        layers.append(layer)
-    layers = nn.ModuleList(layers)
-
-    tok_embeddings = nn.Embedding(vocab_size, embed_dim)
-    output_proj = TiedLinear(tok_embeddings)
-    return TransformerDecoder(
-        tok_embeddings=tok_embeddings,
-        layers=layers,
-        max_seq_len=max_seq_len,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        norm=RMSNorm(embed_dim),
-        output=output_proj,
-    )
-
-
 def llama3_2_1b() -> TransformerDecoder:
-    return llama3_2(
+    return TransformerDecoder(
         vocab_size=128_256,
         num_layers=16,
         num_heads=32,
