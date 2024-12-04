@@ -244,110 +244,6 @@ class Llama3ScaledRoPE(nn.Module):
         return x_out.type_as(x)
 
 
-class KVCache(nn.Module):
-    """
-    Standalone ``nn.Module`` containing a kv-cache to cache past key and values during inference.
-
-    Args:
-        batch_size (int): batch size model will be run with
-        max_seq_len (int): maximum sequence length model will be run with
-        num_kv_heads (int): number of key/value heads.
-        head_dim (int): per-attention head embedding dimension
-        dtype (torch.dtype): dtype for the caches
-    """
-
-    def __init__(
-        self,
-        batch_size: int,
-        max_seq_len: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-    ) -> None:
-        super().__init__()
-        cache_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
-        self.register_buffer(
-            "k_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
-        )
-        self.register_buffer(
-            "v_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
-        )
-        self.register_buffer(
-            "cache_pos", torch.arange(0, cache_shape[2]), persistent=False
-        )
-        self.batch_size = batch_size
-
-    def reset(self) -> None:
-        """Reset the cache to zero."""
-        self.k_cache.zero_()
-        self.v_cache.zero_()
-        self.cache_pos -= self.size
-
-    @property
-    def size(self) -> int:
-        return self.cache_pos[0].item()
-
-    def update(
-        self, k_val: torch.Tensor, v_val: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Update KV cache with the new ``k_val``, ``v_val`` and return the updated cache.
-
-        Note:
-            When updating the KV cache, it is assumed that subsequent updates should update key-value
-            positions in consecutive sequence positions. If you wish to update cache values which have
-            already been filled, use ``.reset()``, which will reset the cache to the zero-th position.
-
-        Example:
-            >>> cache = KVCache(batch_size=2, max_seq_len=16, num_kv_heads=4, head_dim=32, dtype=torch.bfloat16)
-            >>> keys, values = torch.ones((2, 4, 8, 32)), torch.ones((2, 4, 8, 32))
-            >>> cache.update(keys, values)
-            >>> # now positions 0 through 7 are filled
-            >>> cache.size
-            >>> 8
-            >>> keys, values = torch.ones((2, 4, 1, 32)), torch.ones((2, 4, 1, 32))
-            >>> cache.update(keys, values)
-            >>> # this will fill at position 8
-            >>> cache.size
-            >>> 9
-
-        Args:
-            k_val (torch.Tensor): Current key tensor with shape [B, H, S, D]
-            v_val (torch.Tensor): Current value tensor with shape [B, H, S, D]
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Updated key and value cache tensors, respectively.
-
-        Raises:
-            AssertionError: if the sequence length of ``k_val`` is longer than the maximum cache sequence length.
-            ValueError: if the batch size of the new key (or value) tensor is greater than the batch size
-                used during cache setup.
-        """
-        bsz, _, seq_len, _ = k_val.shape
-        if bsz > self.k_cache.shape[0]:
-            raise ValueError(
-                f"The current cache has been setup with a batch size of {self.k_cache.shape[0]}"
-                f", but found new key tensors with batch size {k_val.shape[0]}!"
-            )
-
-        assert (self.cache_pos[0] + seq_len) <= self.k_cache.shape[2]
-        k_out = self.k_cache
-        v_out = self.v_cache
-
-        k_out[:, :, self.cache_pos[:seq_len]] = k_val
-        v_out[:, :, self.cache_pos[:seq_len]] = v_val
-
-        # forward cache_pos seq_len positions along
-        # cache_pos starts at (0, 1, 2, 3, 4, 5, ...)
-        # an update of seq_len = 5 tokens brings it to
-        # (5, 6, 7, 8, 9, ...)
-        # this allows us to track the current position in the cache
-        # after the last update in a compile-friendly way without any dynamism
-        # e.g. relying on an int size tracker, or re-creating cache_pos every time
-        self.cache_pos += seq_len
-
-        return k_out, v_out
-
-
 class MultiHeadAttention(nn.Module):
     """Multi-headed attention layer with support for grouped query
     attention (GQA) introduced in https://arxiv.org/abs/2305.13245v1.
@@ -426,7 +322,7 @@ class MultiHeadAttention(nn.Module):
         pos_embeddings: Optional[nn.Module] = None,
         q_norm: Optional[nn.Module] = None,
         k_norm: Optional[nn.Module] = None,
-        kv_cache: Optional[KVCache] = None,
+        kv_cache = None,
         max_seq_len: int = 4096,
         is_causal: bool = True,
         attn_dropout: float = 0.0,
@@ -473,32 +369,6 @@ class MultiHeadAttention(nn.Module):
         # passes. when disabled, we can have the cache setup but still
         # perform normal forward passes
         self.cache_enabled = False
-
-    def setup_cache(
-        self, batch_size: int, dtype: torch.dtype, max_seq_len: int
-    ) -> None:
-        """Setup key value caches for attention calculation. If called
-        after kv_cache is already setup, this will be skipped.
-
-        Args:
-            batch_size (int): batch size for the caches.
-            dtype (torch.dtype): dtype for the caches.
-            max_seq_len (int): maximum sequence length model will be run with.
-        """
-        # Don't overwrite user defined kv_cache from init
-        if self.kv_cache is not None:
-            _log.warning(
-                "Key value caches are already setup. You cannot call ``setup_caches()`` twice. Skipping."
-            )
-        else:
-            self.kv_cache = KVCache(
-                batch_size=batch_size,
-                max_seq_len=max_seq_len,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-                dtype=dtype,
-            )
-            self.cache_enabled = True
 
     def reset_cache(self):
         """Reset the key value caches."""
@@ -700,42 +570,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         self.sa_scale = sa_scale or nn.Identity()
         self.mlp_scale = mlp_scale or nn.Identity()
 
-    def setup_caches(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        *,
-        encoder_max_seq_len: int,
-        decoder_max_seq_len: int,
-    ) -> None:
-        """Setup key value caches for attention calculation.
-
-        Args:
-            batch_size (int): batch size for the caches.
-            dtype (torch.dtype): dtype for the caches.
-            encoder_max_seq_len (int): this parameter is ignored in this layer.
-            decoder_max_seq_len (int): maximum cache sequence length.
-        """
-        self.attn.setup_cache(batch_size, dtype, max_seq_len=decoder_max_seq_len)
-
-    def caches_are_setup(self) -> bool:
-        """
-        Check if the key value caches are setup on ``self.attn``.
-        See :func:~torchtune.modules.TransformerDecoder.caches_are_setup`.
-        """
-        return self.attn.kv_cache is not None
-
-    def caches_are_enabled(self) -> bool:
-        """
-        Checks if the key value caches on ``self.attn`` are enabled.
-        See :func:~torchtune.modules.TransformerDecoder.caches_are_enabled`.
-        """
-        return self.attn.cache_enabled
-
-    def reset_cache(self):
-        """Reset the key value caches."""
-        self.attn.reset_cache()
-
     def forward(
         self,
         x: torch.Tensor,
@@ -828,42 +662,6 @@ class TransformerCrossAttentionLayer(nn.Module):
         self.mlp_norm = mlp_norm or nn.Identity()
         self.ca_scale = ca_scale or nn.Identity()
         self.mlp_scale = mlp_scale or nn.Identity()
-
-    def setup_caches(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        *,
-        encoder_max_seq_len: int,
-        decoder_max_seq_len: int,
-    ) -> None:
-        """Setup key value caches for attention calculation.
-
-        Args:
-            batch_size (int): batch size for the caches.
-            dtype (torch.dtype): dtype for the caches.
-            encoder_max_seq_len (int): maximum cache sequence length.
-            decoder_max_seq_len (int): this parameter is ignored in this layer.
-        """
-        self.attn.setup_cache(batch_size, dtype, encoder_max_seq_len)
-
-    def caches_are_setup(self) -> bool:
-        """
-        Check if the key value caches are setup on ``self.attn``.
-        See :func:~torchtune.modules.TransformerDecoder.caches_are_setup`.
-        """
-        return self.attn.kv_cache is not None
-
-    def caches_are_enabled(self) -> bool:
-        """
-        Checks if the key value caches on ``self.attn`` are enabled.
-        See :func:~torchtune.modules.TransformerDecoder.caches_are_enabled`.
-        """
-        return self.attn.cache_enabled
-
-    def reset_cache(self):
-        """Reset the key value caches."""
-        self.attn.reset_cache()
 
     def _skip_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Some tokens in x may not attend to any encoder inputs
@@ -1064,87 +862,6 @@ class TransformerDecoder(nn.Module):
         self.encoder_max_cache_seq_len = None
         self.decoder_max_cache_seq_len = None
 
-    def setup_caches(
-        self,
-        batch_size: int,
-        dtype: torch.dtype,
-        *,
-        encoder_max_seq_len: Optional[int] = None,
-        decoder_max_seq_len: Optional[int] = None,
-    ):
-        """
-        Sets up key-value attention caches for inference. For each layer in ``self.layers``:
-            - :class:`~torchtune.modules.TransformerSelfAttentionLayer` will use ``decoder_max_seq_len``.
-            - :class:`~torchtune.modules.TransformerCrossAttentionLayer` will use ``encoder_max_seq_len``.
-            - :class:`~torchtune.modules.model_fusion.FusionLayer` will use ``decoder_max_seq_len`` and ``encoder_max_seq_len``.
-
-        Args:
-            batch_size (int): batch size for the caches.
-            dtype (torch.dtype): dtype for the caches.
-            encoder_max_seq_len (Optional[int]): maximum encoder cache sequence length.
-            decoder_max_seq_len (Optional[int]): maximum decoder cache sequence length.
-        """
-
-        has_encoder_layers = any(
-            isinstance(m, TransformerCrossAttentionLayer) for m in self.modules()
-        )
-        has_decoder_layers = any(
-            isinstance(l, TransformerSelfAttentionLayer) for l in self.layers
-        )
-
-        if has_encoder_layers:
-            if encoder_max_seq_len is not None:
-                self.encoder_max_cache_seq_len = encoder_max_seq_len
-            else:
-                self.encoder_max_cache_seq_len = self.max_seq_len
-
-        if has_decoder_layers:
-            if decoder_max_seq_len is not None:
-                self.decoder_max_cache_seq_len = decoder_max_seq_len
-            else:
-                self.decoder_max_cache_seq_len = self.max_seq_len
-
-        for layer in self.layers:
-            layer.setup_caches(
-                batch_size,
-                dtype,
-                encoder_max_seq_len=self.encoder_max_cache_seq_len,
-                decoder_max_seq_len=self.decoder_max_cache_seq_len,
-            )
-
-    def caches_are_setup(self) -> bool:
-        """
-        Check if the key value caches are setup. This means ``setup_caches`` has been called, and
-        the relevant attention modules in the model have created their ``KVCache``.
-        """
-        return self.layers[0].caches_are_setup()
-
-    def caches_are_enabled(self) -> bool:
-        """
-        Checks if the key value caches are enabled. Once KV-caches have been setup, the relevant
-        attention modules will be "enabled" and all forward passes will update the caches. This behaviour
-        can be disabled without altering the state of the KV-caches by "disabling" the KV-caches
-        using :func:`torchtune.modules.common_utils.disable_kv_cache`, upon which ``caches_are_enabled`` would return False.
-        """
-        return self.layers[0].caches_are_enabled()
-
-    def reset_caches(self):
-        """
-        Resets KV-cache buffers on relevant attention modules to zero, and reset cache positions to zero,
-        without deleting or reallocating cache tensors.
-
-        Raises:
-            RuntimeError: if KV-caches are not setup. Use :func:`~torchtune.modules.TransformerDecoder.setup_caches` to
-                setup caches first.
-        """
-        if not self.caches_are_enabled():
-            raise RuntimeError(
-                "Key value caches are not setup. Call model.setup_caches first."
-            )
-
-        for layer in self.layers:
-            layer.reset_cache()
-
     def _validate_inputs(
         self,
         seq_len: int,
@@ -1174,24 +891,6 @@ class TransformerDecoder(nn.Module):
                 f"seq_len ({seq_len}) of input tensor should be smaller "
                 f"than max_seq_len ({self.max_seq_len})"
             )
-
-        if self.caches_are_enabled():
-            if mask is None:
-                raise ValueError(
-                    "KV-caches for self-attention layers are setup for inference mode, causal masks must be provided!"
-                    " Use the `mask` arg to provide a causal mask."
-                )
-
-            if encoder_input is not None and encoder_mask is None:
-                raise ValueError(
-                    "KV-caches for cross-attention/fusion layers are setup for inference mode and you seem to be using"
-                    " encoder_input, causal masks must be provided! Use the `encoder_mask` arg to provide a causal mask."
-                )
-
-            if input_pos is None:
-                raise ValueError(
-                    "KV-caches are setup for inference mode, input positions must be provided!"
-                )
 
     def forward(
         self,
