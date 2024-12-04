@@ -1,30 +1,9 @@
 import math
-import logging
-from typing import List, Optional, Union, Callable, Dict, Tuple
+from typing import List, Optional, Union, Callable, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-_log = logging.getLogger(__name__)
-
-
-def scale_hidden_dim_for_mlp(dim: int, multiple_of: int = 256) -> int:
-    """Scale hidden dimension for MLP to keep number of parameters and computation constant.
-
-    Args:
-        dim (int): Input dimension.
-        multiple_of (int): Round scaled dimension to nearest multiple of `multiple_of` for clean computation.
-
-    Returns:
-        Scaled hidden dimension.
-    """
-    # Scale hidden dimension by (2/3)4d for SwiGLU to keep number of
-    # parameters and computation constant
-    hidden_dim = 4 * int(2 * dim / 3)
-    # Round hidden dimension to nearest multiple of `multiple_of`
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-    return hidden_dim
 
 
 class TiedLinear:
@@ -322,7 +301,7 @@ class MultiHeadAttention(nn.Module):
         pos_embeddings: Optional[nn.Module] = None,
         q_norm: Optional[nn.Module] = None,
         k_norm: Optional[nn.Module] = None,
-        kv_cache = None,
+        kv_cache=None,
         max_seq_len: int = 4096,
         is_causal: bool = True,
         attn_dropout: float = 0.0,
@@ -1002,9 +981,9 @@ def llama3_2(
     num_kv_heads: int,
     embed_dim: int,
     max_seq_len: int,
+    intermediate_dim: int,
     attn_dropout: float = 0.0,
     rope_base: int = 500_000,
-    intermediate_dim: Optional[int] = None,
     norm_eps: float = 1e-5,
     scale_factor: int = 32,
 ) -> TransformerDecoder:
@@ -1057,11 +1036,7 @@ def llama3_2(
             max_seq_len=max_seq_len,
             attn_dropout=attn_dropout,
         )
-        hidden_dim = (
-            intermediate_dim
-            if intermediate_dim
-            else scale_hidden_dim_for_mlp(embed_dim)
-        )
+        hidden_dim = intermediate_dim
         mlp = FeedForward(dim=embed_dim, hidden_dim=hidden_dim)
         layer = TransformerSelfAttentionLayer(
             attn=self_attn,
