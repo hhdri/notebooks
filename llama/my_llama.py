@@ -641,13 +641,6 @@ class TransformerDecoder(nn.Module):
             self.layers.append(layer)
         self.layers = nn.ModuleList(self.layers)
 
-    def _validate_inputs(self, seq_len: int):
-        if seq_len > self.max_seq_len:
-            raise ValueError(
-                f"seq_len ({seq_len}) of input tensor should be smaller "
-                f"than max_seq_len ({self.max_seq_len})"
-            )
-
     def forward(
         self,
         tokens: torch.Tensor,
@@ -656,7 +649,7 @@ class TransformerDecoder(nn.Module):
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    ) -> torch.Tensor:
         """
         Args:
             tokens (torch.Tensor): input tensor with shape ``[b x s]``
@@ -713,9 +706,12 @@ class TransformerDecoder(nn.Module):
             - m_s: max seq len
         """
         # input tensor of shape [b, s]
-        seq_len = tokens.shape[1]
 
-        self._validate_inputs(seq_len)
+        if tokens.shape[1] > self.max_seq_len:
+            raise ValueError(
+                f"seq_len ({tokens.shape[1]}) of input tensor should be smaller "
+                f"than max_seq_len ({self.max_seq_len})"
+            )
 
         # shape: [b, s, d]
         h = self.tok_embeddings(tokens)
