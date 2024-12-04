@@ -258,7 +258,6 @@ class MultiHeadAttention(nn.Module):
         kv_cache (Optional[KVCache]): KVCache object used to cache key and value
         max_seq_len (int): maximum sequence length supported by the model.
             This is needed to compute the RoPE Cache. Default: 4096.
-        is_causal (bool): sets the default mask to causal when no mask is provided
         attn_dropout (float): dropout value passed onto the scaled_dot_product_attention function.
             Default value is 0.0.
 
@@ -282,7 +281,6 @@ class MultiHeadAttention(nn.Module):
         pos_embeddings: Optional[nn.Module] = None,
         kv_cache=None,
         max_seq_len: int = 4096,
-        is_causal: bool = True,
         attn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -308,7 +306,6 @@ class MultiHeadAttention(nn.Module):
         self.attn_dropout = attn_dropout
         self.head_dim = head_dim
         self.max_seq_len = max_seq_len
-        self.is_causal = is_causal
 
         # Set layers
         self.kv_cache = kv_cache
@@ -327,7 +324,6 @@ class MultiHeadAttention(nn.Module):
         self,
         x: torch.Tensor,
         y: Optional[torch.Tensor] = None,
-        *,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -406,14 +402,14 @@ class MultiHeadAttention(nn.Module):
 
         if mask is not None:
             mask = mask[:, None, :, :]
-            
-        output = nn.functional.scaled_dot_product_attention(
+
+        output = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=self.kv_cache is None and mask is None and self.is_causal,
+            is_causal=self.kv_cache is None and mask is None,
         )
 
         # reshape the output to be the same shape as the input
@@ -438,7 +434,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         self,
         attn: MultiHeadAttention,
         mlp: nn.Module,
-        *,
         sa_norm: Optional[nn.Module] = None,
         mlp_norm: Optional[nn.Module] = None,
     ) -> None:
@@ -448,7 +443,9 @@ class TransformerSelfAttentionLayer(nn.Module):
         self.sa_norm = sa_norm
         self.mlp_norm = mlp_norm
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, **_: Dict) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, **_: Dict
+    ) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): input tensor with shape
@@ -525,7 +522,6 @@ class TransformerDecoder(nn.Module):
 
     def __init__(
         self,
-        *,
         vocab_size: int,
         num_layers: int,
         rope_base: int,
@@ -542,10 +538,10 @@ class TransformerDecoder(nn.Module):
         self.max_seq_len = max_seq_len
         self.num_heads = num_heads
 
-        self.tok_embeddings = nn.Embedding(vocab_size, embed_dim)
-        self.norm = RMSNorm(embed_dim)
-        self.output = TiedLinear(self.tok_embeddings)
         self.head_dim = embed_dim // num_heads
+        self.norm = RMSNorm(embed_dim)
+        self.tok_embeddings = nn.Embedding(vocab_size, embed_dim)
+        self.output = TiedLinear(self.tok_embeddings)
         rope = Llama3ScaledRoPE(
             dim=self.head_dim,
             max_seq_len=max_seq_len,
@@ -648,10 +644,7 @@ class TransformerDecoder(nn.Module):
         for layer in self.layers:
             # shape: [b, s, d]
             h = layer(
-                h,
-                mask=mask,
-                encoder_input=encoder_input,
-                encoder_mask=encoder_mask,
+                h, mask=mask, encoder_input=encoder_input, encoder_mask=encoder_mask
             )
 
         # shape: [b, s, d]
