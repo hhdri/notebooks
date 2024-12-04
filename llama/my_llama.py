@@ -538,16 +538,12 @@ class TransformerSelfAttentionLayer(nn.Module):
         *,
         sa_norm: Optional[nn.Module] = None,
         mlp_norm: Optional[nn.Module] = None,
-        sa_scale: Optional[nn.Module] = None,
-        mlp_scale: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
         self.attn = attn
         self.mlp = mlp
-        self.sa_norm = sa_norm or nn.Identity()
-        self.mlp_norm = mlp_norm or nn.Identity()
-        self.sa_scale = sa_scale or nn.Identity()
-        self.mlp_scale = mlp_scale or nn.Identity()
+        self.sa_norm = sa_norm
+        self.mlp_norm = mlp_norm
 
     def forward(
         self,
@@ -592,13 +588,13 @@ class TransformerSelfAttentionLayer(nn.Module):
         attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
 
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
-        h = self.sa_scale(attn_out) + x
+        h = attn_out + x
 
         # Norm applied before the feedforward layer
         mlp_out = self.mlp(self.mlp_norm(h))
 
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
-        out = h + self.mlp_scale(mlp_out)
+        out = h + mlp_out
         return out
 
 
