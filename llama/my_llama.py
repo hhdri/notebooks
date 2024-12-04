@@ -367,7 +367,7 @@ class MultiHeadAttention(nn.Module):
         # x has shape [b, s_x, d]
         # y has shape [b, s_y, d]
         b, s_x, _ = x.shape
-        s_y = y.shape[1] if y is not None else 0
+        s_y = y.shape[1]
 
         # q has shape [b, s_x, num_heads * head_dim]
         q = self.q_proj(x)
@@ -376,52 +376,37 @@ class MultiHeadAttention(nn.Module):
         q_per_kv = self.num_heads // self.num_kv_heads
         q = q.view(b, s_x, self.num_kv_heads * q_per_kv, self.head_dim)
 
-        # Apply positional embeddings
-        if self.pos_embeddings is not None:
-            q = self.pos_embeddings(q)
+        q = self.pos_embeddings(q)
 
         # [b, n_h, s_x, h_d]
         q = q.transpose(1, 2)
 
-        if y is None:
-            if self.kv_cache is None or not self.cache_enabled:
-                raise ValueError(
-                    "Must provide y input or use kv_cache to enable streaming decoding"
-                )
-            k = self.kv_cache.k_cache
-            v = self.kv_cache.v_cache
-        else:
-            # Update k and v shape, positional embeddings, and normalization
+        # Update k and v shape, positional embeddings, and normalization
 
-            # k,v shape [b, s_y, num_kv_heads * head_dim]
-            k = self.k_proj(y)
-            v = self.v_proj(y)
+        # k,v shape [b, s_y, num_kv_heads * head_dim]
+        k = self.k_proj(y)
+        v = self.v_proj(y)
 
-            # Apply positional embeddings
-            # k,v shape: [b, s_y, n_kv, h_d]
-            k = k.view(b, s_y, -1, self.head_dim)
-            v = v.view(b, s_y, -1, self.head_dim)
-            if self.pos_embeddings is not None:
-                k = self.pos_embeddings(k)
+        # Apply positional embeddings
+        # k,v shape: [b, s_y, n_kv, h_d]
+        k = k.view(b, s_y, -1, self.head_dim)
+        v = v.view(b, s_y, -1, self.head_dim)
+        k = self.pos_embeddings(k)
 
-            # k,v shape: [b, n_kv, s_y, h_d]
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+        # k,v shape: [b, n_kv, s_y, h_d]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
 
-            # Update key-value cache
-            if self.kv_cache is not None and self.cache_enabled:
-                k, v = self.kv_cache.update(k, v)
-
-        # If needed, expand the key and value tensors to have the same shape
+        # Expand the key and value tensors to have the same shape
         # as the query tensor by copying values across the relevant dim
         # k,v shape: [b, n_kv, s, h_d] -> [b, n_h, s, h_d]
-        if self.num_heads != self.num_kv_heads:
-            expand_shape = (b, self.num_kv_heads, q_per_kv, -1, self.head_dim)
-            k = k.unsqueeze(2).expand(expand_shape).flatten(1, 2)
-            v = v.unsqueeze(2).expand(expand_shape).flatten(1, 2)
+        expand_shape = (b, self.num_kv_heads, q_per_kv, -1, self.head_dim)
+        k = k.unsqueeze(2).expand(expand_shape).flatten(1, 2)
+        v = v.unsqueeze(2).expand(expand_shape).flatten(1, 2)
 
         if mask is not None:
             mask = mask[:, None, :, :]
+            
         output = nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -463,13 +448,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         self.sa_norm = sa_norm
         self.mlp_norm = mlp_norm
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        mask: Optional[torch.Tensor] = None,
-        **kwargs: Dict,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, **_: Dict) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): input tensor with shape
@@ -601,7 +580,6 @@ class TransformerDecoder(nn.Module):
     def forward(
         self,
         tokens: torch.Tensor,
-        *,
         mask: Optional[torch.Tensor] = None,
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
