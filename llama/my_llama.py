@@ -1,4 +1,3 @@
-import math
 from typing import Optional, Dict
 
 import torch
@@ -142,7 +141,7 @@ class Llama3ScaledRoPE(nn.Module):
         high_freq_wavelen = old_context_len / high_freq_factor
         new_freqs = []
         for freq in freqs:
-            wavelen = 2 * math.pi / freq
+            wavelen = 2 * torch.pi / freq
             if wavelen < high_freq_wavelen:
                 new_freqs.append(freq)
             elif wavelen > low_freq_wavelen:
@@ -156,17 +155,12 @@ class Llama3ScaledRoPE(nn.Module):
         return torch.tensor(new_freqs, dtype=freqs.dtype, device=freqs.device)
 
     def forward(
-        self, x: torch.Tensor, *, input_pos: Optional[torch.Tensor] = None
+        self, x: torch.Tensor
     ) -> torch.Tensor:
         """
         Args:
             x (torch.Tensor): input tensor with shape
                 [b, s, n_h, h_d]
-            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
-                of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape [b, s].
-                During inference, this indicates the position of the current token.
-                If none, assume the index of the token is its position id. Default is None.
 
         Returns:
             Tensor: output tensor with RoPE applied
@@ -189,10 +183,7 @@ class Llama3ScaledRoPE(nn.Module):
         # input tensor has shape [b, s, n_h, h_d]
         seq_len = x.size(1)
 
-        # extract the values based on whether input_pos is set or not
-        rope_cache = (
-            self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
-        )
+        rope_cache = self.cache[:seq_len]
 
         # reshape input; the last dimension is used for computing the output.
         # Cast to float to match the reference implementation
@@ -352,7 +343,6 @@ class MultiHeadAttention(nn.Module):
         y: Optional[torch.Tensor] = None,
         *,
         mask: Optional[torch.Tensor] = None,
-        input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -372,11 +362,6 @@ class MultiHeadAttention(nn.Module):
                 created via `create_block_mask <https://pytorch.org/blog/flexattention/#mask-mods>`_. We  use
                 :func:`~torch.nn.attention.flex_attention.flex_attention` when computing attention with block masks.
                 Default is None.
-            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
-                of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape [b x s].
-                During inference, this indicates the position of the current token.
-                If none, assume the index of the token is its position id. Default is None.
 
         Raises:
             ValueError: If no ``y`` input and ``kv_cache`` is not enabled.
@@ -407,7 +392,7 @@ class MultiHeadAttention(nn.Module):
 
         # Apply positional embeddings
         if self.pos_embeddings is not None:
-            q = self.pos_embeddings(q, input_pos=input_pos)
+            q = self.pos_embeddings(q)
 
         # [b, n_h, s_x, h_d]
         q = q.transpose(1, 2)
@@ -435,7 +420,7 @@ class MultiHeadAttention(nn.Module):
             k = k.view(b, s_y, -1, self.head_dim)
             v = v.view(b, s_y, -1, self.head_dim)
             if self.pos_embeddings is not None:
-                k = self.pos_embeddings(k, input_pos=input_pos)
+                k = self.pos_embeddings(k)
 
             # k,v shape: [b, n_kv, s_y, h_d]
             k = k.transpose(1, 2)
@@ -505,7 +490,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         x: torch.Tensor,
         *,
         mask: Optional[torch.Tensor] = None,
-        input_pos: Optional[torch.Tensor] = None,
         **kwargs: Dict,
     ) -> torch.Tensor:
         """
@@ -525,11 +509,6 @@ class TransformerSelfAttentionLayer(nn.Module):
                 created via `create_block_mask <https://pytorch.org/blog/flexattention/#mask-mods>`_. We  use
                 :func:`~torch.nn.attention.flex_attention.flex_attention` when computing attention with block masks.
                 Default is None.
-            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
-                of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape [b x s].
-                During inference, this indicates the position of the current token.
-                If none, assume the index of the token is its position id. Default is None.
             **kwargs (Dict): transformer layer inputs not relevant to self attention.
 
         Returns:
@@ -540,7 +519,7 @@ class TransformerSelfAttentionLayer(nn.Module):
         # [b, s, d]
         # Norm applied before self-attention
         h = self.sa_norm(x)
-        attn_out = self.attn(h, h, mask=mask, input_pos=input_pos)
+        attn_out = self.attn(h, h, mask=mask)
 
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         h = attn_out + x
@@ -648,7 +627,6 @@ class TransformerDecoder(nn.Module):
         mask: Optional[torch.Tensor] = None,
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
-        input_pos: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -673,11 +651,6 @@ class TransformerDecoder(nn.Module):
                 to embedding ``j`` in the decoder. Mask has shape ``[b x s x s_e]``. Default is None,
                 but this is required during inference if the model has been setup with any layers
                 which use encoder embeddings and caches have been setup.
-            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
-                of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape ``[b x s]``.
-                During inference, this indicates the position of the current token.
-                This parameter is required during inference if caches have been setup. Default is None.
 
         Returns:
             Union[torch.Tensor, List[torch.Tensor]]: output tensor with shape ``[b x s x v]`` or a list of layer
@@ -723,7 +696,6 @@ class TransformerDecoder(nn.Module):
                 mask=mask,
                 encoder_input=encoder_input,
                 encoder_mask=encoder_mask,
-                input_pos=input_pos,
             )
 
         # shape: [b, s, d]
