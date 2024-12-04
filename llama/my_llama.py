@@ -1115,15 +1115,14 @@ class FeedForward(nn.Module):
     def __init__(
         self,
         *,
-        gate_proj: nn.Module,
-        down_proj: nn.Module,
-        up_proj: Optional[nn.Module] = None,
+        dim: int,
+        hidden_dim: int,
         activation: nn.Module = nn.SiLU(),
     ):
         super().__init__()
-        self.w1 = gate_proj
-        self.w2 = down_proj
-        self.w3 = up_proj
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
         self.activation = activation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1546,7 +1545,7 @@ def llama3_2(
             if intermediate_dim
             else scale_hidden_dim_for_mlp(embed_dim)
         )
-        mlp = llama3_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+        mlp = FeedForward(dim=embed_dim, hidden_dim=hidden_dim)
         layer = TransformerSelfAttentionLayer(
             attn=self_attn,
             mlp=mlp,
@@ -1567,28 +1566,6 @@ def llama3_2(
         norm=RMSNorm(embed_dim, eps=norm_eps),
         output=output_proj,
     )
-
-
-def llama3_mlp(dim: int, hidden_dim: int, quantize_base: bool = False) -> FeedForward:
-    """
-    Build the MLP layer associated with the Llama model.
-    """
-    gate_proj = (
-        nn.Linear(dim, hidden_dim, bias=False)
-        if not quantize_base
-        else FrozenNF4Linear(dim, hidden_dim, bias=False)
-    )
-    down_proj = (
-        nn.Linear(hidden_dim, dim, bias=False)
-        if not quantize_base
-        else FrozenNF4Linear(hidden_dim, dim, bias=False)
-    )
-    up_proj = (
-        nn.Linear(dim, hidden_dim, bias=False)
-        if not quantize_base
-        else FrozenNF4Linear(dim, hidden_dim, bias=False)
-    )
-    return FeedForward(gate_proj=gate_proj, down_proj=down_proj, up_proj=up_proj)
 
 
 def llama3_2_1b() -> TransformerDecoder:
