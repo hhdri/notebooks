@@ -1,18 +1,15 @@
 import copy
 import math
-from functools import lru_cache
 import logging
 from typing import List, Optional, Union, Callable, Dict, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import distributed as dist
 from torchao.dtypes.nf4tensor import linear_nf4, to_nf4
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
 _MaskType = Union[torch.Tensor, BlockMask]
-_SUPPORTS_FLEX_ATTENTION = True
 flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
 
 
@@ -268,11 +265,6 @@ class Llama3ScaledRoPE(nn.Module):
         return x_out.type_as(x)
 
 
-@lru_cache(None)
-def log_once(logger: logging.Logger, msg: str, level: int = logging.INFO) -> None:
-    logger.log(logger=logger, msg=msg, level=level)
-
-
 def _flex_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -289,7 +281,7 @@ def _flex_attention(
     # This will use flash attention under the hood with support for custom masks.
     # Currently, it is used when sample packing is enabled (see torchtune.datasets.PackedDataset)
     if isinstance(mask, BlockMask):
-        log_once(
+        _log.log(
             _log,
             "Using flex attention for attention computation since a BlockMask was passed in.",
             level=logging.DEBUG,
