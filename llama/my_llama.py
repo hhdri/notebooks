@@ -14,6 +14,44 @@ class TiedLinear:
         return F.linear(x, self.tied_module.weight)
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.normalized_shape = (dim,)
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # computation is in fp32
+        return F.rms_norm(
+            x.float(),
+            normalized_shape=self.normalized_shape,
+            weight=self.scale,
+            eps=1e-5,
+        ).to(x.dtype)
+
+
+class FeedForward(nn.Module):
+    """This class implements the feed-forward network derived from Llama2.
+
+    Args:
+        gate_proj (nn.Module): Projection from input dim to hidden dim, fed through activation
+            and multiplied by up_proj.
+        down_proj (nn.Module): Final projection to output dim.
+        up_proj (Optional[nn.Module]): Projection from input dim to hidden dim, multiplied by
+            activation(gate_proj).
+        activation (nn.Module): Activation function to use. Default is nn.SiLU().
+    """
+
+    def __init__(self, *, dim: int, hidden_dim: int):
+        super().__init__()
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
 class Llama3ScaledRoPE(nn.Module):
     """
     This class implements Rotary Positional Embeddings (RoPE)
@@ -319,14 +357,6 @@ class MultiHeadAttention(nn.Module):
         # perform normal forward passes
         self.cache_enabled = False
 
-    def reset_cache(self):
-        """Reset the key value caches."""
-        if self.kv_cache is None:
-            raise RuntimeError(
-                "Key value caches are not setup. Call ``setup_caches()`` first."
-            )
-        self.kv_cache.reset()
-
     def forward(
         self,
         x: torch.Tensor,
@@ -454,22 +484,6 @@ class MultiHeadAttention(nn.Module):
         return self.output_proj(output)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.normalized_shape = (dim,)
-        self.scale = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # computation is in fp32
-        return F.rms_norm(
-            x.float(),
-            normalized_shape=self.normalized_shape,
-            weight=self.scale,
-            eps=1e-5,
-        ).to(x.dtype)
-
-
 class TransformerSelfAttentionLayer(nn.Module):
     """
     Transformer layer derived from the Llama2 model. Normalization is applied before the attention **and** FF layer.
@@ -548,28 +562,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         # Residual connection; shape: [batch_size, seq_length, embed_dim]
         out = h + mlp_out
         return out
-
-
-class FeedForward(nn.Module):
-    """This class implements the feed-forward network derived from Llama2.
-
-    Args:
-        gate_proj (nn.Module): Projection from input dim to hidden dim, fed through activation
-            and multiplied by up_proj.
-        down_proj (nn.Module): Final projection to output dim.
-        up_proj (Optional[nn.Module]): Projection from input dim to hidden dim, multiplied by
-            activation(gate_proj).
-        activation (nn.Module): Activation function to use. Default is nn.SiLU().
-    """
-
-    def __init__(self, *, dim: int, hidden_dim: int):
-        super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerDecoder(nn.Module):
@@ -735,7 +727,6 @@ def llama3_2(
     intermediate_dim: int,
     attn_dropout: float = 0.0,
     rope_base: int = 500_000,
-    norm_eps: float = 1e-5,
     scale_factor: int = 32,
 ) -> TransformerDecoder:
     """
@@ -761,7 +752,6 @@ def llama3_2(
             Default: 0.0
         intermediate_dim (Optional[int]): intermediate dimension for MLP. If not specified,
             this is computed using :func:`~torchtune.modules.scale_hidden_dim_for_mlp`
-        norm_eps (float): epsilon in RMS norms.
         scale_factor (int): scaling factor for RoPE. Default: 32
 
     Returns:
@@ -809,12 +799,6 @@ def llama3_2(
 
 
 def llama3_2_1b() -> TransformerDecoder:
-    """
-    Builder for creating a Llama3.2 model initialized w/ the default 1b parameter values.
-
-    Returns:
-        TransformerDecoder: Instantiation of Llama3.2 1B model
-    """
     return llama3_2(
         vocab_size=128_256,
         num_layers=16,
