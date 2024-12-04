@@ -602,142 +602,6 @@ class TransformerSelfAttentionLayer(nn.Module):
         return out
 
 
-class TransformerCrossAttentionLayer(nn.Module):
-    """
-    Cross attention Transformer layer following the same conventions as the TransformerSelfAttentionLayer.
-    Normalization is applied before the attention **and** FF layer.
-
-    Args:
-        attn (MultiHeadAttention): Attention module.
-        mlp (nn.Module): Feed-forward module.
-        ca_norm (Optional[nn.Module]): Normalization to be applied before cross-attention.
-        mlp_norm (Optional[nn.Module]): Normalization to be applied before the feed-forward layer.
-        ca_scale (Optional[nn.Module]): Module to scale cross-attention output.
-        mlp_scale (Optional[nn.Module]): Module to scale the feed-forward output.
-
-    Raises:
-        AssertionError: if attn.pos_embeddings is set.
-    """
-
-    def __init__(
-        self,
-        attn: MultiHeadAttention,
-        mlp: nn.Module,
-        *,
-        ca_norm: Optional[nn.Module] = None,
-        mlp_norm: Optional[nn.Module] = None,
-        ca_scale: Optional[nn.Module] = None,
-        mlp_scale: Optional[nn.Module] = None,
-    ) -> None:
-        super().__init__()
-        if attn.pos_embeddings is not None:
-            raise AssertionError(
-                "Doesn't support positional embeddings for cross attention, \
-                because q and k are different sequences."
-            )
-        self.attn = attn
-        self.mlp = mlp
-        self.ca_norm = ca_norm or nn.Identity()
-        self.mlp_norm = mlp_norm or nn.Identity()
-        self.ca_scale = ca_scale or nn.Identity()
-        self.mlp_scale = mlp_scale or nn.Identity()
-
-    def _skip_mask(self, mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Some tokens in x may not attend to any encoder inputs
-        due to the cross attention mask (encoder_mask). This results in
-        a full row of the attention matrix being masked out.
-
-        In the example below, the word "the" is masked from every embedding.
-        The False value means a token can't attend to an embedding.
-
-        .. code-block:: text
-
-            |emb||emb||emb|
-        |The| F    F    F
-        |red| T    F    T
-        |car| F    T    T
-
-        This results in no inputs into the softmax layer which causes a NaN.
-        The skip mask is used to mask the outputs of attention and
-        mlp resulting in the token being skipped.
-
-        The above example would result in a skip mask of: [[True], [False], [False]]
-        which specifies which tokens to fully mask out.
-
-        """
-        # no skip_mask if no masking
-        if mask is None:
-            return None
-        # negate mask and convert to boolean mask
-        if mask.dtype == torch.bool:
-            mask = ~mask
-        else:
-            mask = torch.isneginf(mask)
-        # True where all elements in a row are True
-        mask = torch.all(mask, dim=-1, keepdim=True)
-        return mask
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        encoder_input: Optional[torch.Tensor] = None,
-        encoder_mask: Optional[torch.Tensor] = None,
-        **kwargs: Dict,
-    ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor with shape
-                [batch_size x seq_length x embed_dim]
-            encoder_input (Optional[torch.Tensor]): Optional input embeds from the encoder. Shape
-                [batch_size x token_sequence x embed_dim]
-            encoder_mask (Optional[torch.Tensor]):  Boolean tensor defining a relational matrix between
-                tokens and encoder embeddings. A True value at position i,j means token i can attend
-                to embedding j in the decoder. Mask has shape [batch_size x token_sequence x embed_sequence].
-                Default is None.
-            **kwargs (Dict): transformer layer inputs not relevant to self attention.
-
-        Returns:
-            torch.Tensor: output tensor with same shape as input
-                [batch_size x seq_length x embed_dim]
-        """
-        # During decoding, it's possible encoder_input is None because the embeds
-        # are already stored in the kv cache.
-        empty_cache = not self.caches_are_enabled() or self.attn.kv_cache.size == 0
-        # Skip cross attention when no secondary input as it's primary purpose
-        # is to attend between x and encoder_input.
-        if encoder_input is None and empty_cache:
-            return x
-
-        # A mask of tokens (x) with no encoder_input
-        skip_mask = self._skip_mask(encoder_mask)
-        if encoder_mask is not None:
-            # TODO: remove after PyTorch 2.5 is released
-            # This unmasks the skipped rows to avoid NaNs in SDPA Softmax backward
-            # This doesn't affect the output since outputs are masked out later
-            encoder_mask = encoder_mask.masked_fill(skip_mask, True)
-
-        # Input tensor and attention output have the same shape
-        # [b, s, d]
-        # Norm applied before self-attention
-        # TODO: Add support for sample packing and bring back input_pos
-        attn_out = self.attn(self.ca_norm(x), encoder_input, mask=encoder_mask)
-        if skip_mask is not None:
-            attn_out = attn_out.masked_fill(skip_mask, 0)
-
-        # Residual connection; shape: [batch_size, seq_length, embed_dim]
-        h = self.ca_scale(attn_out) + x
-
-        # Norm applied before the feedforward layer
-        mlp_out = self.mlp(self.mlp_norm(h))
-        if skip_mask is not None:
-            mlp_out = mlp_out.masked_fill(skip_mask, 0)
-
-        # Residual connection; shape: [batch_size, seq_length, embed_dim]
-        out = h + self.mlp_scale(mlp_out)
-        return out
-
-
 class FeedForward(nn.Module):
     """This class implements the feed-forward network derived from Llama2.
 
@@ -750,31 +614,14 @@ class FeedForward(nn.Module):
         activation (nn.Module): Activation function to use. Default is nn.SiLU().
     """
 
-    def __init__(
-        self,
-        *,
-        dim: int,
-        hidden_dim: int,
-    ):
+    def __init__(self, *, dim: int, hidden_dim: int):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor with shape ``(..., in_dim)``, where ``in_dim`` is the
-                input dimension of both ``gate_proj`` and ``up_proj``.
-
-        Returns:
-            torch.Tensor: output tensor with shape ``(..., out_dim)``, where ``out_dim`` is the \
-                output dimension of ``down_proj``.
-        """
-        h = F.silu(self.w1(x))
-        h = h * self.w3(x)
-        h = self.w2(h)
-        return h
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class TransformerDecoder(nn.Module):
